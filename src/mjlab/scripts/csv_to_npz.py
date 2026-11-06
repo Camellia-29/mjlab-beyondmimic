@@ -309,7 +309,7 @@ def run_sim(
         ):
           log[k] = np.stack(log[k], axis=0)
 
-        print("Saving to /tmp/motion.npz...")
+        '''print("Saving to /tmp/motion.npz...")
         np.savez("/tmp/motion.npz", **log)
 
         print("Uploading to Weights & Biases...")
@@ -337,7 +337,24 @@ def run_sim(
           print("Logging video to wandb...")
           wandb.log({"motion_video": wandb.Video("./motion.mp4", format="mp4")})
 
-        wandb.finish()
+        wandb.finish()'''
+                # 修改保存路径：指定绝对路径
+        save_dir = "/root/autodl-tmp/mjlab-main/data/npz"
+        
+        # 提前确保目录存在（防止因为没建文件夹报错）
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, f"{output_name}.npz")
+        print(f"\nSaving to {save_path}...")
+        np.savez(save_path, **log)
+
+        if render:
+          import mediapy as media
+          print("Creating video...")
+          video_path = os.path.join(save_dir, f"{output_name}.mp4")
+          media.write_video(video_path, frames, fps=output_fps)
+          print(f"Video saved to {video_path}")
 
 
 def main(
