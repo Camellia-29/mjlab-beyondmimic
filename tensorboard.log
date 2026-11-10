@@ -1,0 +1,9 @@
+nohup: ignoring input
+Traceback (most recent call last):
+  File "/root/autodl-tmp/mjlab-main/.venv/bin/tensorboard", line 4, in <module>
+    from tensorboard.main import run_main
+  File "/root/autodl-tmp/mjlab-main/.venv/lib/python3.13/site-packages/tensorboard/main.py", line 27, in <module>
+    from tensorboard import default
+  File "/root/autodl-tmp/mjlab-main/.venv/lib/python3.13/site-packages/tensorboard/default.py", line 30, in <module>
+    import pkg_resources
+ModuleNotFoundError: No module named 'pkg_resources'
