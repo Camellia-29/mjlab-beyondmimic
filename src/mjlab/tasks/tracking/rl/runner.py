@@ -1,3 +1,4 @@
+
 import os
 from typing import cast
 
@@ -98,6 +99,20 @@ class MotionTrackingOnPolicyRunner(MjlabOnPolicyRunner):
 
   def save(self, path: str, infos=None):
     super().save(path, infos)
+
+    # Export sampling statistics alongside the model checkpoint.
+    motion_term = cast(
+      MotionCommand, self.env.unwrapped.command_manager.get_term("motion")
+    )
+    iteration = int(self.current_learning_iteration)
+    motion_term.record_sampling_snapshot(iteration)
+
+    statistics_dir = os.path.join(
+      os.path.dirname(os.path.abspath(path)),
+      "sampling_analysis",
+    )
+    motion_term.export_sampling_statistics(statistics_dir)
+
     # LogWriter has no hook for linking an input artifact, so this stays W&B-only.
     uploaded = (
       isinstance(self.logger.writer, WandbLogWriter) and self.cfg["upload_model"]

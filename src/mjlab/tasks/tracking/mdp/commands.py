@@ -1,7 +1,10 @@
+
 from __future__ import annotations
 
 import copy
+import csv
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -118,6 +121,36 @@ class MotionCommand(CommandTerm):
     self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["sampling_top1_prob"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
+
+    # Sampling statistics: cumulative RSI initialization counts.
+    self.initial_frame_count = torch.zeros(
+      self.motion.time_step_total, dtype=torch.long, device=self.device
+    )
+    self.initial_bin_count = torch.zeros(
+      self.bin_count, dtype=torch.long, device=self.device
+    )
+
+    # Map every reference frame to the same Bin indexing used by adaptive sampling.
+    frame_indices = torch.arange(
+      self.motion.time_step_total, dtype=torch.long, device=self.device
+    )
+    frame_bins = torch.clamp(
+      (frame_indices * self.bin_count) // max(self.motion.time_step_total, 1),
+      0,
+      self.bin_count - 1,
+    )
+    self._uniform_bin_probabilities = (
+      torch.bincount(frame_bins, minlength=self.bin_count).float()
+      / max(self.motion.time_step_total, 1)
+    )
+
+    self._sampling_probabilities = self._uniform_bin_probabilities.clone()
+    self._probability_history: list[np.ndarray] = []
+    self._probability_iterations: list[int] = []
+    self._last_snapshot_iteration: int | None = None
+
+    # Records only actual completed episodes (dones=True).
+    self._episode_records: list[dict[str, int | bool | str]] = []
 
     self._ghost_model = None
     self._ghost_color = np.array(cfg.viz.ghost_color, dtype=np.float32)
@@ -264,7 +297,7 @@ class MotionCommand(CommandTerm):
     )
     sampling_probabilities = torch.nn.functional.pad(
       sampling_probabilities.unsqueeze(0).unsqueeze(0),
-      (0, self.cfg.adaptive_kernel_size - 1),  # Non-causal kernel
+      (0, self.cfg.adaptive_kernel_size - 1),
       mode="replicate",
     )
     sampling_probabilities = torch.nn.functional.conv1d(
@@ -282,6 +315,9 @@ class MotionCommand(CommandTerm):
       * (self.motion.time_step_total - 1)
     ).long()
 
+    # Sampling statistics: retain the actual distribution used by multinomial.
+    self._sampling_probabilities = sampling_probabilities.detach().clone()
+
     # Update metrics.
     H = -(sampling_probabilities * (sampling_probabilities + 1e-12).log()).sum()
     H_norm = H / math.log(self.bin_count) if self.bin_count > 1 else 1.0
@@ -294,9 +330,122 @@ class MotionCommand(CommandTerm):
     self.time_steps[env_ids] = torch.randint(
       0, self.motion.time_step_total, (len(env_ids),), device=self.device
     )
-    self.metrics["sampling_entropy"][:] = 1.0  # Maximum entropy for uniform.
+    self._sampling_probabilities = self._uniform_bin_probabilities.clone()
+    self.metrics["sampling_entropy"][:] = 1.0
     self.metrics["sampling_top1_prob"][:] = 1.0 / self.bin_count
-    self.metrics["sampling_top1_bin"][:] = 0.5  # No specific bin preference.
+    self.metrics["sampling_top1_bin"][:] = 0.5
+
+  # Sampling statistics: record the actual RSI frame after resampling.
+  def _record_initial_frames(self, env_ids: torch.Tensor) -> None:
+    frames = self.time_steps[env_ids].clamp(
+      min=0, max=self.motion.time_step_total - 1
+    )
+    bins = torch.clamp(
+      (frames * self.bin_count) // max(self.motion.time_step_total, 1),
+      0,
+      self.bin_count - 1,
+    )
+    self.initial_frame_count += torch.bincount(
+      frames, minlength=self.motion.time_step_total
+    )
+    self.initial_bin_count += torch.bincount(bins, minlength=self.bin_count)
+
+  # Sampling statistics: record terminal information before CommandTerm.reset
+  # clears the termination buffers and resamples the next episode.
+  def _record_completed_episodes(self, env_ids: torch.Tensor) -> None:
+    termination_manager = self._env.termination_manager
+    dones = termination_manager.dones[env_ids].detach().bool()
+    terminated = termination_manager.terminated[env_ids].detach().bool()
+    terminal_frames = self.time_steps[env_ids].detach().clone()
+
+    completed_indices = torch.where(dones)[0]
+    if completed_indices.numel() == 0:
+      return
+
+    terminal_frames = terminal_frames.clamp(
+      min=0, max=self.motion.time_step_total - 1
+    )
+    terminal_bins = torch.clamp(
+      (terminal_frames * self.bin_count) // max(self.motion.time_step_total, 1),
+      0,
+      self.bin_count - 1,
+    )
+
+    env_ids_cpu = env_ids.detach().cpu().tolist()
+    frames_cpu = terminal_frames.cpu().tolist()
+    bins_cpu = terminal_bins.cpu().tolist()
+    terminated_cpu = terminated.cpu().tolist()
+    dones_cpu = dones.cpu().tolist()
+
+    for local_idx in completed_indices.cpu().tolist():
+      is_terminated = bool(terminated_cpu[local_idx])
+      self._episode_records.append(
+        {
+          "env_id": int(env_ids_cpu[local_idx]),
+          "terminal_frame": int(frames_cpu[local_idx]),
+          "terminal_bin": int(bins_cpu[local_idx]),
+          "terminated": is_terminated,
+          "truncated": bool(dones_cpu[local_idx] and not is_terminated),
+          "outcome": "terminated" if is_terminated else "truncated",
+        }
+      )
+
+  # Sampling statistics: take one probability snapshot per training iteration.
+  def record_sampling_snapshot(self, iteration: int) -> None:
+    if self._last_snapshot_iteration == iteration:
+      return
+
+    self._probability_history.append(
+      self._sampling_probabilities.detach().cpu().numpy().copy()
+    )
+    self._probability_iterations.append(int(iteration))
+    self._last_snapshot_iteration = int(iteration)
+
+  # Sampling statistics: export cumulative statistics and probability history.
+  def export_sampling_statistics(self, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+
+    if self._probability_history:
+      probability_history = np.stack(self._probability_history, axis=0)
+    else:
+      probability_history = np.empty((0, self.bin_count), dtype=np.float32)
+
+    np.savez_compressed(
+      os.path.join(output_dir, "sampling_statistics.npz"),
+      initial_frame_count=self.initial_frame_count.detach().cpu().numpy(),
+      initial_bin_count=self.initial_bin_count.detach().cpu().numpy(),
+      uniform_bin_probabilities=self._uniform_bin_probabilities.detach().cpu().numpy(),
+      current_sampling_probabilities=self._sampling_probabilities.detach().cpu().numpy(),
+      probability_history=probability_history,
+      probability_iterations=np.asarray(self._probability_iterations, dtype=np.int64),
+      bin_failed_count=self.bin_failed_count.detach().cpu().numpy(),
+      current_bin_failed=self._current_bin_failed.detach().cpu().numpy(),
+      motion_time_step_total=np.asarray(self.motion.time_step_total),
+      bin_count=np.asarray(self.bin_count),
+      sampling_mode=np.asarray(self.cfg.sampling_mode),
+      adaptive_alpha=np.asarray(self.cfg.adaptive_alpha),
+      adaptive_lambda=np.asarray(self.cfg.adaptive_lambda),
+      adaptive_kernel_size=np.asarray(self.cfg.adaptive_kernel_size),
+      adaptive_uniform_ratio=np.asarray(self.cfg.adaptive_uniform_ratio),
+    )
+
+    with open(
+      os.path.join(output_dir, "episode_records.csv"),
+      "w",
+      newline="",
+      encoding="utf-8",
+    ) as csv_file:
+      fieldnames = [
+        "env_id",
+        "terminal_frame",
+        "terminal_bin",
+        "terminated",
+        "truncated",
+        "outcome",
+      ]
+      writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+      writer.writeheader()
+      writer.writerows(self._episode_records)
 
   def _write_reference_state_to_sim(
     self,
@@ -320,6 +469,11 @@ class MotionCommand(CommandTerm):
   def _resample_command(self, env_ids: torch.Tensor):
     if self.cfg.sampling_mode == "start":
       self.time_steps[env_ids] = 0
+      start_probabilities = torch.zeros(
+        self.bin_count, dtype=torch.float32, device=self.device
+      )
+      start_probabilities[0] = 1.0
+      self._sampling_probabilities = start_probabilities
     elif self.cfg.sampling_mode == "uniform":
       self._uniform_sampling(env_ids)
     else:
@@ -407,7 +561,22 @@ class MotionCommand(CommandTerm):
     )
 
   def reset(self, env_ids: torch.Tensor | slice | None) -> dict[str, float]:
+    # Normalize env_ids for statistics; preserve the original argument for reset.
+    if env_ids is None:
+      stats_env_ids = torch.arange(self.num_envs, device=self.device)
+    elif isinstance(env_ids, slice):
+      stats_env_ids = torch.arange(self.num_envs, device=self.device)[env_ids]
+    else:
+      stats_env_ids = env_ids
+
+    # Read terminal buffers before super().reset() clears/resets them.
+    self._record_completed_episodes(stats_env_ids)
+
     extras = super().reset(env_ids)
+
+    # Record the actual frames selected by the reset resampling.
+    self._record_initial_frames(stats_env_ids)
+
     # Reset-path resamples are followed by the env's own forward(); only
     # compute-path resamples (wraparound or timer expiry) need our refresh.
     self._pending_forward = False
